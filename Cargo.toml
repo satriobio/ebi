@@ -3,6 +3,10 @@ name = "ebi"
 version = "0.1.0"
 edition = "2021"
 
+[profile.dev]
+debug = true
+split-debuginfo = "unpacked"
+
 [dependencies]
 bio = "0.41.0"
 libloading = "0.8"

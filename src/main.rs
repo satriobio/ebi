@@ -1,10 +1,8 @@
+use rayon::prelude::*;
 use dlopen::raw::Library;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::File;
-use std::io::{self, BufRead};
 use std::os::raw::{c_int, c_uint, c_uchar};
-use std::ptr;
 use bio::io::fasta;
 
 #[repr(C)]
@@ -41,16 +39,7 @@ struct CSsw {
 
 impl CSsw {
     fn new(s_lib_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        // let s_lib_name = "./";
-        // let path = if !s_lib_path.is_empty() {
-        //     format!("{}/{}", s_lib_path, s_lib_name)
-        // } else {
-        //     s_lib_name.to_string()
-        // };
-
-        let path = "/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/ebi/libssw.so";
-
-        let lib = Library::open(&path)?;
+        let lib = Library::open(s_lib_path)?;
 
         unsafe {
             let ssw_init = lib.symbol("ssw_init")?;
@@ -68,38 +57,6 @@ impl CSsw {
         }
     }
 }
-
-
-fn read_matrix(file_path: &str) -> (Vec<String>, HashMap<String, usize>, HashMap<usize, String>, Vec<i32>) {
-    let file = File::open(file_path).expect("Unable to open file");
-    let reader = io::BufReader::new(file);
-
-    let mut lines = reader.lines();
-    while let Some(Ok(line)) = lines.next() {
-        if !line.starts_with('#') {
-            let l_ele: Vec<String> = line.trim().split_whitespace().map(String::from).collect();
-            let mut d_ele2int = HashMap::new();
-            let mut d_int2ele = HashMap::new();
-
-            for (i, ele) in l_ele.iter().enumerate() {
-                d_ele2int.insert(ele.clone(), i);
-                d_ele2int.insert(ele.to_lowercase(), i);
-                d_int2ele.insert(i, ele.clone());
-            }
-
-            let mut l_score = Vec::new();
-            for line in lines {
-                let line = line.expect("Unable to read line");
-                l_score.extend(line.trim().split_whitespace().skip(1).map(|x| x.parse::<i32>().unwrap()));
-            }
-
-            return (l_ele, d_ele2int, d_int2ele, l_score);
-        }
-    }
-
-    panic!("Matrix file is empty or does not contain valid data");
-}
-
 
 fn read_fasta(file_path: &str) -> impl Iterator<Item = (String, String)> {
     let reader = fasta::Reader::from_file(file_path).expect("Failed to read FASTA file");
@@ -126,30 +83,46 @@ fn align_one(
     n_flag: u8,
     n_mask_len: i32
 ) -> (u32, u32, i32, i32, i32, i32, i32, i32, Vec<u32>) {
-    // Call the FFI function and handle the result
-    let res = unsafe { (ssw.ssw_align)(q_profile, r_num.as_ptr() as *const c_uchar, n_r_len, n_open, n_ext, n_flag, 0, 0, n_mask_len) };
-
-    if res.is_null() {
-        panic!("Alignment failed: returned null pointer");
+    // Ensure q_profile is not null
+    if q_profile.is_null() {
+        eprintln!("Error: q_profile is null.");
+        return (0, 0, 0, 0, 0, 0, 0, 0, Vec::new());
     }
 
-    // Dereference the result pointer safely
-    let res = unsafe { &*res };
+    // Call the ssw_align function
+    let res_ptr = unsafe { (ssw.ssw_align)(
+        q_profile,
+        r_num.as_ptr() as *const c_uchar,
+        n_r_len,
+        n_open,
+        n_ext,
+        n_flag,
+        0,
+        0,
+        n_mask_len
+    )};
 
-    // Ensure the cigar length is valid before allocation
+    // Ensure alignment result is not null
+    if res_ptr.is_null() {
+        eprintln!("Error: ssw_align returned null.");
+        // Call destroy functions to avoid memory leaks
+        unsafe { (ssw.init_destroy)(q_profile) };
+        return (0, 0, 0, 0, 0, 0, 0, 0, Vec::new());
+    }
+
+    // Safely dereference the result pointer
+    let res = unsafe { &*res_ptr };
     let s_cigar_len = res.nCigarLen as usize;
-    if s_cigar_len == 0 {
-        return (res.nScore, res.nScore2, res.nRefBeg, res.nRefEnd, res.nQryBeg, res.nQryEnd, res.nRefEnd2, 0, Vec::new());
-    }
 
-    // Safely collect cigar values
-    let l_cigar: Vec<u32> = (0..s_cigar_len).map(|i| unsafe { *res.sCigar.add(i) }).collect();
+    // Collect cigar values if sCigar is not null
+    let l_cigar: Vec<u32> = if s_cigar_len > 0 && !res.sCigar.is_null() {
+        (0..s_cigar_len).map(|i| unsafe { *res.sCigar.add(i) }).collect()
+    } else {
+        Vec::new()
+    };
 
-    // Print score - ensure no issues here
-    // println!("Score: {}", res.nScore);
-
-    // Return the tuple
-    (
+    // Prepare result tuple
+    let result = (
         res.nScore,
         res.nScore2,
         res.nRefBeg,
@@ -159,25 +132,25 @@ fn align_one(
         res.nRefEnd2,
         s_cigar_len as i32,
         l_cigar
-    )
+    );
+
+    // Clean up resources using the mutable pointer
+    unsafe { (ssw.align_destroy)(res_ptr) };
+
+    result
 }
-
-
 
 fn main() {
     let query = "/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/ebi/query.fa";
     let target = "/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/ebi/gencode.v46.transcripts.200bp.fa";
 
-    // Define constants
     let n_match = 2;
     let n_mismatch = 2;
     let n_open = 3;
     let n_ext = 1;
 
-    // Define elements and mappings
     let l_ele = ['A', 'C', 'G', 'T', 'N'];
 
-    // Use `String` as key type
     let mut d_ele2int = HashMap::new();
     let mut d_int2ele = HashMap::new();
 
@@ -187,79 +160,70 @@ fn main() {
         d_int2ele.insert(i, ele);
     }
 
-    // Compute scoring matrix
     let n_ele_num = l_ele.len();
-    let mut l_score = vec![0; n_ele_num * n_ele_num];
-    for i in 0..n_ele_num {
-        for j in 0..n_ele_num {
-            l_score[i * n_ele_num + j] = if l_ele[i] == l_ele[j] { n_match } else { -n_mismatch };
-        }
-    }
+    let l_score: Vec<i8> = (0..n_ele_num).flat_map(|i| {
+        (0..n_ele_num).map(move |j| {
+            if l_ele[i] == l_ele[j] { n_match } else { -n_mismatch }
+        })
+    }).map(|x| x as i8).collect();
 
-    // Convert scoring matrix to i8 type
-    let mut mat: Vec<i8> = l_score.into_iter().map(|x| x as i8).collect();
+    let mat = l_score;
 
-    // Load the SSW library
-    let ssw = unsafe { CSsw::new("./").expect("Failed to load SSW library") };
+    let ssw = unsafe { CSsw::new("/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/ebi/libssw.so").expect("Failed to load SSW library") };
 
-    let mut best_score = u32::MIN;
-    // let mut best_alignment = None;
-    // let mut ref_id = None;
+    let r_num_vec: Vec<(String, Vec<i8>)> = read_fasta(target)
+        .map(|(id, seq)| (id, to_int(&seq, &d_ele2int, l_ele.len())))
+        .collect();
 
-    let mut best_alignments: HashMap<String, (String, u32)> = HashMap::new();
+    let best_alignments: HashMap<String, (String, u32)> = read_fasta(query)
+        .par_bridge() // Use parallel iterator
+        .map(|(s_q_id, s_q_seq)| {
+            let q_num = to_int(&s_q_seq, &d_ele2int, l_ele.len());
+            let q_profile = unsafe { (ssw.ssw_init)(
+                q_num.as_ptr() as *const c_uchar,
+                q_num.len() as c_int,
+                mat.as_ptr() as *const c_uchar,
+                l_ele.len() as c_int,
+                1
+            )};
 
-    for (s_q_id, s_q_seq) in read_fasta(query) {
-        let q_num = to_int(&s_q_seq, &d_ele2int, l_ele.len());
-        let q_profile = unsafe { (ssw.ssw_init)(
-            q_num.as_ptr() as *const c_uchar,
-            q_num.len() as c_int,
-            mat.as_ptr() as *const c_uchar,
-            l_ele.len() as c_int,
-            1
-        )};
-
-        if q_profile.is_null() {
-            eprintln!("Error: q_profile is null.");
-            continue;
-        }
-
-        let n_mask_len = (s_q_seq.len() / 2) as i32;
-        let mut best_score = u32::MIN;
-        let mut best_ref_id = String::new();
-
-        for (s_r_id, s_r_seq) in read_fasta(target) {
-            let r_num = to_int(&s_r_seq, &d_ele2int, l_ele.len());
-            if r_num.is_empty() {
-                eprintln!("Error: r_num is empty for target {}", s_r_id);
-                continue;
+            if q_profile.is_null() {
+                eprintln!("Error: q_profile is null for query {}", s_q_id);
+                return (s_q_id, (String::new(), u32::MIN));
             }
 
-            unsafe {
-                let (score, _, _, _, _, _, _, _, _) = align_one(
-                    &ssw, q_profile, &r_num, r_num.len() as i32, n_open, n_ext, 0, n_mask_len
-                );
-                if score == u32::MAX {
-                    eprintln!("Error: Invalid score value.");
+            let n_mask_len = (s_q_seq.len() / 2) as i32;
+            let mut best_score = u32::MIN;
+            let mut best_ref_id = String::new();
+
+            for (s_r_id, r_num) in &r_num_vec {
+                if r_num.is_empty() {
+                    eprintln!("Error: r_num is empty for target {}", s_r_id);
                     continue;
                 }
-                if score > best_score {
-                    best_score = score;
-                    best_ref_id = s_r_id.clone();
+
+                unsafe {
+                    let (score, _, _, _, _, _, _, _, _) = align_one(
+                        &ssw, q_profile, r_num, r_num.len() as i32, n_open, n_ext, 0, n_mask_len
+                    );
+                    if score == u32::MAX {
+                        eprintln!("Error: Invalid score value.");
+                        continue;
+                    }
+                    if score > best_score {
+                        best_score = score;
+                        best_ref_id = s_r_id.clone();
+                    }
                 }
             }
-        }
 
-        unsafe { if !q_profile.is_null() { (ssw.init_destroy)(q_profile); } }
+            unsafe { (ssw.init_destroy)(q_profile); }
 
-        if best_score != u32::MIN {
-            best_alignments.insert(s_q_id, (best_ref_id, best_score));
-        }
-    }
+            (s_q_id, (best_ref_id, best_score))
+        })
+        .collect();
 
     for (query_id, (ref_id, score)) in best_alignments {
         println!("Query ID: {}, Best Reference ID: {}, Best Score: {}", query_id, ref_id, score);
     }
-
-    
-    
 }
