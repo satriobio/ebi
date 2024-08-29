@@ -1,79 +1,84 @@
+extern crate seal;
+extern crate bio;
+extern crate rayon;
+
+use seal::pair::{Alignment, AlignmentSet, InMemoryAlignmentMatrix, NeedlemanWunsch, SmithWaterman, Step};
 use bio::io::fasta;
-use bio::alignment::pairwise::*;
-use bio::scores::blosum62;
 use rayon::prelude::*;
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use rayon::ThreadPoolBuilder;
+
+
+// Function to read FASTA file and return sequences as a HashMap
+fn read_fasta(filename: &str) -> HashMap<String, String> {
+    let reader = fasta::Reader::from_file(filename).expect("Failed to read FASTA file");
+    reader.records()
+        .map(|record| {
+            let record = record.expect("Error reading record");
+            (
+                record.id().to_owned(),
+                String::from_utf8_lossy(record.seq()).to_string() // Convert &[u8] to String
+            )
+        })
+        .collect()
+}
+
+// Function to align a read against all reference sequences and store the best alignment
+fn align_reads(reads: &HashMap<String, String>, references: &HashMap<String, String>, use_local: bool) -> HashMap<String, (String, isize)> {
+    let strategy = SmithWaterman::new(2, -1, -1, -1);
+
+    // Create a custom thread pool with 8 threads
+    let pool = ThreadPoolBuilder::new().num_threads(16).build().unwrap();
+    pool.install(|| {
+        // Use Rayon to parallelize the computation
+        let best_alignments: HashMap<String, (String, isize)> = reads.par_iter().map(|(read_name, read_sequence)| {
+            let read_chars: Vec<char> = read_sequence.chars().collect();
+            let mut best_score = isize::MIN;
+            let mut best_ref_name = String::new();
+
+            // Parallelize the processing of references for each read
+            let (best_ref_name_for_read, best_score_for_read) = references.par_iter().map(|(ref_name, ref_sequence)| {
+                let ref_chars: Vec<char> = ref_sequence.chars().collect();
+                let set: AlignmentSet<InMemoryAlignmentMatrix> =
+                    AlignmentSet::new(read_chars.len(), ref_chars.len(), strategy.clone(), |x, y| {
+                        read_chars[x] == ref_chars[y]
+                    })
+                    .unwrap();
+
+                let alignment = if use_local {
+                    set.local_alignment()
+                } else {
+                    set.global_alignment()
+                };
+
+                let score = alignment.score();
+                (ref_name.clone(), score)
+            }).max_by_key(|(_, score)| *score) // Get the reference with the best score
+            .unwrap_or((String::new(), isize::MIN)); // Fallback if no references are found
+
+            (read_name.clone(), (best_ref_name_for_read, best_score_for_read))
+        }).collect();
+
+        best_alignments
+    })
+}
+
+// Print the best alignment results
+fn print_best_alignments(best_alignments: &HashMap<String, (String, isize)>) {
+    for (read_name, (ref_name, score)) in best_alignments {
+        println!("Read: {}, Best Reference: {}, Score: {}", read_name, ref_name, score);
+    }
+}
 
 fn main() {
-    // Load the reference sequences from a FASTA file
-    let fasta_file = "/home/OXFORDNANOLABS/swibowo/git/ebi/gencode.v46.transcripts.200bp.fa";
-    let reader = fasta::Reader::from_file(fasta_file).expect("Failed to read FASTA file");
+    let reads_filename = "/query.fa";
+    let references_filename = "gencode.v46.transcripts.200bp.fa";
 
-    let references: Vec<_> = reader.records()
-        .map(|r| {
-            let record = r.expect("Error reading record");
-            (record.id().to_owned(), record.seq().to_owned())
-        })
-        .collect();
 
-    // Load the query sequence from a FASTA file
-    let query_fasta_file = "/home/OXFORDNANOLABS/swibowo/git/ebi/query.fa";
-    let query_reader = fasta::Reader::from_file(query_fasta_file).expect("Failed to read query FASTA file");
+    let reads = read_fasta(reads_filename);
+    let references = read_fasta(references_filename);
 
-    let query_sequence: Vec<u8> = query_reader.records()
-        .next()
-        .expect("No query sequence found")
-        .expect("Error reading query sequence")
-        .seq()
-        .to_owned();
+    let best_alignments = align_reads(&reads, &references, true);  // Set to `false` for global alignment
 
-    // Shared reference to store the highest score and alignment
-    let highest_score_alignment = Arc::new(Mutex::new((0, String::new(), String::new())));
-
-    // Set the number of threads for the Rayon thread pool
-    let num_threads = 8; // Adjust the number of threads here
-    // let pool = rayon::ThreadPoolBuilder::new()
-    //     .num_threads(num_threads)
-    //     .build()
-    //     .unwrap();
-
-    // pool.install(|| {
-    //     // Align against each reference sequence in parallel
-    //     references.par_iter().for_each(|(id, seq)| {
-    //         let mut aligner = Aligner::with_capacity(query_sequence.len(), seq.len(), -5, -1, &blosum62);
-    //         let alignment = aligner.local(&query_sequence, seq);
-
-    //         let score = alignment.score;
-
-    //         // Update the highest score and corresponding alignment
-    //         let mut highest = highest_score_alignment.lock().unwrap();
-    //         if score > highest.0 {
-    //             *highest = (score, id.clone(), String::from_utf8_lossy(seq).into_owned());
-    //         }
-    //     });
-    // });
-
-    for (id, seq) in references.iter() {
-        let mut aligner = Aligner::with_capacity(query_sequence.len(), seq.len(), -5, -1, &blosum62);
-        let alignment = aligner.local(&query_sequence, seq);
-    
-        let score = alignment.score;
-    
-        // Update the highest score and corresponding alignment
-        let mut highest = highest_score_alignment.lock().unwrap();
-        if score > highest.0 {
-            *highest = (score, id.clone(), String::from_utf8_lossy(seq).into_owned());
-        }
-    }    
-
-    // Get the highest score alignment
-    let highest = highest_score_alignment.lock().unwrap();
-    let (score, ref_id, ref_seq) = &*highest;
-
-    // Output the highest score alignment
-    println!("Highest score: {}", score);
-    println!("Aligned reference ID: {}", ref_id);
-    println!("Reference sequence: {}", ref_seq);
-
-    // Note: The BAM output step is not implemented, you may use appropriate libraries to write BAM files.
+    print_best_alignments(&best_alignments);
 }
