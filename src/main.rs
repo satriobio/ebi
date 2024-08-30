@@ -1,5 +1,4 @@
 use rayon::prelude::*;
-use rayon::ThreadPoolBuilder;
 use dlopen::raw::Library;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -175,13 +174,6 @@ fn main() {
     let r_num_vec: Vec<(String, Vec<i8>)> = read_fasta(target)
         .map(|(id, seq)| (id, to_int(&seq, &d_ele2int, l_ele.len())))
         .collect();
-
-    // Configure Rayon thread pool
-    let num_threads = 4; // Set this to the number of threads you want to use
-    ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global()
-        .expect("Failed to create Rayon thread pool");
 
     let best_alignments: HashMap<String, (String, u32)> = read_fasta(query)
         .par_bridge() // Use parallel iterator
