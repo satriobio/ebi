@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_int, c_uint, c_uchar};
 use bio::io::fasta;
+use std::env;
+use std::io::{self, Write}; // Import for handling stdout
 
 #[repr(C)]
 struct CAlignRes {
@@ -141,8 +143,22 @@ fn align_one(
 }
 
 fn main() {
-    let query = "/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/ebi/query.fa";
-    let target = "/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/ebi/gencode.v46.transcripts.200bp.fa";
+    let args: Vec<String> = std::env::args().collect();
+    
+    if args.len() < 5 {
+        eprintln!("Usage: {} <reference_fasta> <query fasta> --thread <num_threads>", args[0]);
+        std::process::exit(1);
+    }
+
+    let reference = &args[1];
+    let query = &args[2];
+    let thread_arg = &args[3];
+    let num_threads: usize = args[4].parse().expect("Invalid number of threads");
+
+    if thread_arg != "--thread" {
+        eprintln!("Expected --thread flag, found {}", thread_arg);
+        return;
+    }
 
     let n_match = 2;
     let n_mismatch = 2;
@@ -171,7 +187,7 @@ fn main() {
 
     let ssw = unsafe { CSsw::new("/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/ebi/libssw.so").expect("Failed to load SSW library") };
 
-    let r_num_vec: Vec<(String, Vec<i8>)> = read_fasta(target)
+    let r_num_vec: Vec<(String, Vec<i8>)> = read_fasta(reference)
         .map(|(id, seq)| (id, to_int(&seq, &d_ele2int, l_ele.len())))
         .collect();
 
@@ -224,6 +240,8 @@ fn main() {
         .collect();
 
     for (query_id, (ref_id, score)) in best_alignments {
-        println!("Query ID: {}, Best Reference ID: {}, Best Score: {}", query_id, ref_id, score);
+        // println!("Query ID: {}, Best Reference ID: {}, Best Score: {}", query_id, ref_id, score);
+        writeln!(io::stdout(), "{}\t{}\t{}", query_id, ref_id, score).expect("Failed to write to stdout");
+
     }
 }
