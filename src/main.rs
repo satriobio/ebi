@@ -1,11 +1,12 @@
 use rayon::prelude::*;
+use rayon::ThreadPoolBuilder;
 use dlopen::raw::Library;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::raw::{c_int, c_uint, c_uchar};
 use bio::io::fasta;
 use std::env;
-use std::io::{self, Write}; // Import for handling stdout
+use std::io::Write;
 
 #[repr(C)]
 struct CAlignRes {
@@ -143,30 +144,28 @@ fn align_one(
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    
-    if args.len() < 5 {
-        eprintln!("Usage: {} <reference_fasta> <query fasta> --thread <num_threads>", args[0]);
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 4 {
+        eprintln!("Usage: {} <reference_fasta> <query_fasta> --thread <num_threads>", args[0]);
         std::process::exit(1);
     }
 
-    let reference = &args[1];
-    let query = &args[2];
-    let thread_arg = &args[3];
-    let num_threads: usize = args[4].parse().expect("Invalid number of threads");
+    let reference_path = &args[1];
+    let query_fasta = &args[2];
+    let num_threads: usize = args.iter()
+        .position(|arg| arg == "--thread")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8); // Default to 8 threads if not specified
 
-    if thread_arg != "--thread" {
-        eprintln!("Expected --thread flag, found {}", thread_arg);
-        return;
-    }
+    ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .expect("Failed to create Rayon thread pool");
 
-    let n_match = 2;
-    let n_mismatch = 2;
-    let n_open = 3;
-    let n_ext = 1;
+    let ssw = unsafe { CSsw::new("./libssw.so").expect("Failed to load SSW library") };
 
     let l_ele = ['A', 'C', 'G', 'T', 'N'];
-
     let mut d_ele2int = HashMap::new();
     let mut d_int2ele = HashMap::new();
 
@@ -179,20 +178,17 @@ fn main() {
     let n_ele_num = l_ele.len();
     let l_score: Vec<i8> = (0..n_ele_num).flat_map(|i| {
         (0..n_ele_num).map(move |j| {
-            if l_ele[i] == l_ele[j] { n_match } else { -n_mismatch }
+            if l_ele[i] == l_ele[j] { 2 } else { -2 }
         })
     }).map(|x| x as i8).collect();
 
     let mat = l_score;
-
-    let ssw = unsafe { CSsw::new("/mnt/869990e7-a61f-469f-99fe-a48d24ac44ca/git/ebi/libssw.so").expect("Failed to load SSW library") };
-
-    let r_num_vec: Vec<(String, Vec<i8>)> = read_fasta(reference)
+    let r_num_vec: Vec<(String, Vec<i8>)> = read_fasta(reference_path)
         .map(|(id, seq)| (id, to_int(&seq, &d_ele2int, l_ele.len())))
         .collect();
 
-    let best_alignments: HashMap<String, (String, u32)> = read_fasta(query)
-        .par_bridge() // Use parallel iterator
+    let best_alignments: HashMap<String, (String, u32)> = read_fasta(query_fasta)
+        .par_bridge()
         .map(|(s_q_id, s_q_seq)| {
             let q_num = to_int(&s_q_seq, &d_ele2int, l_ele.len());
             let q_profile = unsafe { (ssw.ssw_init)(
@@ -220,7 +216,7 @@ fn main() {
 
                 unsafe {
                     let (score, _, _, _, _, _, _, _, _) = align_one(
-                        &ssw, q_profile, r_num, r_num.len() as i32, n_open, n_ext, 0, n_mask_len
+                        &ssw, q_profile, r_num, r_num.len() as i32, 3, 1, 0, n_mask_len
                     );
                     if score == u32::MAX {
                         eprintln!("Error: Invalid score value.");
@@ -239,9 +235,9 @@ fn main() {
         })
         .collect();
 
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
     for (query_id, (ref_id, score)) in best_alignments {
-        // println!("Query ID: {}, Best Reference ID: {}, Best Score: {}", query_id, ref_id, score);
-        writeln!(io::stdout(), "{}\t{}\t{}", query_id, ref_id, score).expect("Failed to write to stdout");
-
+        writeln!(handle, "{}\t{}\t{}", query_id, ref_id, score).expect("Failed to write to stdout");
     }
 }
